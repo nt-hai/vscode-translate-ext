@@ -2,7 +2,7 @@
   "name": "quick-translate",
   "displayName": "Quick Translate",
   "description": "Select text in any file and get a Google Translate popup right in the editor.",
-  "version": "0.0.23",
+  "version": "0.0.27",
   "publisher": "haint",
   "license": "MIT",
   "repository": {
@@ -75,8 +75,54 @@
       {
         "command": "quickTranslate.clearCache",
         "title": "Translate: Clear Cache"
+      },
+      {
+        "command": "quickTranslate.showPanel",
+        "title": "Translate: Show Translations Panel",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "quickTranslate.clearHistory",
+        "title": "Translate: Clear Translation History",
+        "icon": "$(clear-all)"
       }
     ],
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "quickTranslate",
+          "title": "Quick Translate",
+          "icon": "assets/icons/translate.svg",
+          "when": "!quickTranslate.leftSidebar"
+        }
+      ],
+      "activitybar": [
+        {
+          "id": "quickTranslateBar",
+          "title": "Quick Translate",
+          "icon": "assets/icons/translate.svg",
+          "when": "quickTranslate.leftSidebar"
+        }
+      ]
+    },
+    "views": {
+      "quickTranslate": [
+        {
+          "type": "webview",
+          "id": "quickTranslate.transcript",
+          "name": "Quick Translate",
+          "when": "!quickTranslate.leftSidebar"
+        }
+      ],
+      "quickTranslateBar": [
+        {
+          "type": "webview",
+          "id": "quickTranslate.transcriptBar",
+          "name": "Quick Translate",
+          "when": "quickTranslate.leftSidebar"
+        }
+      ]
+    },
     "keybindings": [
       {
         "command": "quickTranslate.translateSelection",
@@ -131,6 +177,42 @@
           ],
           "description": "Language codes shown as one-click shortcuts inside the popup. Set to [] to hide the row."
         },
+        "quickTranslate.showResultIn": {
+          "type": "string",
+          "enum": [
+            "popup",
+            "panel",
+            "both"
+          ],
+          "enumDescriptions": [
+            "The hover popup, as before. The panel still records every translation; it just is not brought up.",
+            "The Translations panel only. No hover popup is opened, so nothing else can draw in it — the way to keep GitLens' commit card out of a translation for good.",
+            "Open the popup and bring the panel up behind it."
+          ],
+          "default": "popup",
+          "markdownDescription": "Where an answered request is shown. Every translation is recorded in the **Translations** panel whichever this is set to — the setting only decides what is brought up. `panel` is the one option that leaves the hover widget entirely: a hover is shared with every other extension answering that position, a webview is not.",
+          "scope": "window"
+        },
+        "quickTranslate.panelLocation": {
+          "type": "string",
+          "enum": [
+            "secondary",
+            "activitybar"
+          ],
+          "enumDescriptions": [
+            "The Secondary Side Bar on the right, where Claude Code and Copilot Chat sit.",
+            "The activity bar on the left, alongside Explorer and Source Control."
+          ],
+          "default": "secondary",
+          "markdownDescription": "Which side bar the Translations panel is contributed to. A container is placed by where it is declared, so changing this swaps one declaration for the other — **reload the window** for it to take. Editors older than the Secondary Side Bar contribution point (some VS Code forks) show nothing on `secondary`; use `activitybar` there. Either way the view can be dragged between the two afterwards and the workbench remembers where you put it.",
+          "scope": "application"
+        },
+        "quickTranslate.historySize": {
+          "type": "number",
+          "default": 50,
+          "minimum": 1,
+          "description": "How many translations the panel keeps. The oldest are dropped once the transcript passes this."
+        },
         "quickTranslate.popupTrigger": {
           "type": "string",
           "enum": [
@@ -147,7 +229,38 @@
         "quickTranslate.showIconOnSelect": {
           "type": "boolean",
           "default": true,
-          "description": "Show a small translate icon right after the selected text."
+          "description": "Show a small translate icon next to the selected text."
+        },
+        "quickTranslate.iconPosition": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "after",
+            "before"
+          ],
+          "enumDescriptions": [
+            "After the selection, except where that would put the icon in the end-of-line strip shared with GitLens, Error Lens and inline suggestions — there it goes in front instead.",
+            "Always after the last selected character.",
+            "Always in front of the first selected character."
+          ],
+          "default": "auto",
+          "markdownDescription": "Which side of the selection the 🌐 marker hangs off. An icon placed *after* a selection that ends at end of line is drawn in the strip past the last character, which GitLens blame, Error Lens and inline suggestions also write into — the marker then lands behind them, far to the right or off screen. `auto` puts it in front of the selection for exactly those lines."
+        },
+        "quickTranslate.popupPosition": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "end",
+            "start"
+          ],
+          "enumDescriptions": [
+            "At the end of the selection, except where that end is the end of the line — there the popup opens at the front instead, so GitLens' blame card does not open on top of it.",
+            "Always at the end of the selection. On a selection that runs to end of line this shares the popup with GitLens' blame card, which is drawn above the translation.",
+            "Always at the front of the selection."
+          ],
+          "default": "auto",
+          "markdownDescription": "Which end of the selection the translation popup opens at. VS Code gives every extension answering one position the same popup, and the column past the last character of a line is where GitLens answers with its commit card — so a popup asked for at the end of a full-line selection opens with that card above the translation. `auto` opens at the front for exactly those selections; set `end` to keep the popup at the end and live with the card, or turn `#gitlens.hovers.currentLine.enabled#` off.",
+          "scope": "window"
         },
         "quickTranslate.manualSelectionOnly": {
           "type": "boolean",
@@ -237,7 +350,10 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "package": "npx --yes @vscode/vsce package --no-dependencies",
+    "install-ext": "code --install-extension quick-translate-$npm_package_version.vsix --force",
+    "uninstall-ext": "code --uninstall-extension haint.quick-translate"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

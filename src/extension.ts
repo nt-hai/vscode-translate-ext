@@ -1,15 +1,32 @@
 import * as vscode from 'vscode';
 import { LANGUAGES, Language, languageName } from './languages';
+import { TranslationPanel } from './panel';
 import { clearCache, isCached, translate, ttsUrl, webUrl } from './translate';
 
 const SECTION = 'quickTranslate';
 
-let iconDecoration: vscode.TextEditorDecorationType;
-let loadingDecoration: vscode.TextEditorDecorationType;
+/** Which end of the selection the marker's glyph hangs off. */
+type Side = 'before' | 'after';
+
+const SIDES: readonly Side[] = ['before', 'after'];
+
+/** The marker's paint, and the hourglass that stands in for it, one per side. */
+let icons: Record<Side, vscode.TextEditorDecorationType>;
+let loaders: Record<Side, vscode.TextEditorDecorationType>;
 let statusBar: vscode.StatusBarItem;
 let selectionTimer: NodeJS.Timeout | undefined;
-let lastResult: { source: string; translated: string; from: string; to: string } | undefined;
+/** An answered request: what was sent, what came back, and in which pair. */
+interface Answered {
+    source: string;
+    translated: string;
+    /** What the engine reported, which under `auto` is the language it detected. */
+    from: string;
+    to: string;
+}
+
+let lastResult: Answered | undefined;
 let output: vscode.OutputChannel;
+let panel: TranslationPanel | undefined;
 let state: vscode.Memento | undefined;
 let secrets: vscode.SecretStorage | undefined;
 
@@ -51,28 +68,20 @@ export function activate(context: vscode.ExtensionContext): void {
     secrets = context.secrets;
     void migrateApiKey();
 
-    iconDecoration = vscode.window.createTextEditorDecorationType({
-        after: {
-            contentText: ' 🌐',
-            margin: '0 0 0 0.25em',
-            fontStyle: 'normal',
-            // An attachment has no `cursor` of its own, but textDecoration is
-            // passed through as raw CSS, so the pointer rides along with it.
-            textDecoration: 'none; cursor: pointer'
-        },
-        cursor: 'pointer',
-        rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed
-    });
+    icons = paint('🌐', true);
 
     // Shown in the marker's place while the request is out. The status bar
     // progress is easy to miss — this sits where the click just happened.
-    loadingDecoration = vscode.window.createTextEditorDecorationType({
-        after: {
-            contentText: ' ⏳',
-            margin: '0 0 0 0.25em',
-            fontStyle: 'normal'
-        },
-        rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed
+    loaders = paint('⏳');
+
+    promoteHover();
+
+    void applyPanelLocation();
+
+    panel = new TranslationPanel(context, {
+        translate: translateFreeText,
+        speak: (text, lang) => speak(text, lang),
+        openInBrowser: (text, from, to) => openInBrowser(text, from, to)
     });
 
     statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -82,10 +91,18 @@ export function activate(context: vscode.ExtensionContext): void {
 
     context.subscriptions.push(
         output,
-        iconDecoration,
-        loadingDecoration,
+        ...SIDES.map(side => icons[side]),
+        ...SIDES.map(side => loaders[side]),
         statusBar,
-        vscode.languages.registerHoverProvider({ scheme: '*', language: '*' }, { provideHover }),
+        new vscode.Disposable(() => hover?.dispose()),
+        // One provider, both containers: only the side bar `panelLocation`
+        // allows ever resolves, and the transcript is scrolled and the input
+        // holds a draft, so neither may be torn down when the view is hidden.
+        ...TranslationPanel.viewIds.map(id =>
+            vscode.window.registerWebviewViewProvider(id, panel!, {
+                webviewOptions: { retainContextWhenHidden: true }
+            })
+        ),
         vscode.window.onDidChangeTextEditorSelection(onSelectionChange),
         vscode.window.onDidChangeActiveTextEditor(() => {
             // Only the active editor is ever re-rendered, so the one just left
@@ -99,6 +116,9 @@ export function activate(context: vscode.ExtensionContext): void {
         }),
         vscode.workspace.onDidChangeConfiguration(e => {
             if (e.affectsConfiguration(SECTION)) {
+                if (e.affectsConfiguration(`${SECTION}.panelLocation`)) {
+                    void applyPanelLocation();
+                }
                 updateStatusBar();
                 scheduleDecoration();
             }
@@ -116,6 +136,8 @@ export function activate(context: vscode.ExtensionContext): void {
         ),
         vscode.commands.registerCommand(`${SECTION}.setApiKey`, setApiKey),
         vscode.commands.registerCommand(`${SECTION}.clearApiKey`, clearApiKey),
+        vscode.commands.registerCommand(`${SECTION}.showPanel`, () => panel?.reveal()),
+        vscode.commands.registerCommand(`${SECTION}.clearHistory`, () => panel?.clear()),
         vscode.commands.registerCommand(`${SECTION}.clearCache`, () => {
             clearCache();
             vscode.window.showInformationMessage('Quick Translate: cache cleared.');
@@ -210,6 +232,52 @@ function updateStatusBar(): void {
     const to = cfg.get<string>('targetLanguage', 'vi')!;
     statusBar.text = `$(globe) ${from} → ${to}`;
     statusBar.show();
+    panel?.refresh();
+}
+
+/**
+ * Publishes the side bar choice as a context key.
+ *
+ * The two view containers are declared against opposite values of it, which is
+ * the only way an extension gets to say where a container lives: the location
+ * comes from which contribution point it is declared under, so choosing means
+ * declaring both and letting a `when` clause retire one.
+ */
+async function applyPanelLocation(): Promise<void> {
+    const left = config().get<string>('panelLocation', 'secondary') === 'activitybar';
+    await vscode.commands.executeCommand('setContext', `${SECTION}.leftSidebar`, left);
+}
+
+/** Where an answered request is shown. */
+function resultTarget(cfg: vscode.WorkspaceConfiguration): 'popup' | 'panel' | 'both' {
+    const configured = cfg.get<string>('showResultIn', 'popup');
+    return configured === 'panel' || configured === 'both' ? configured : 'popup';
+}
+
+/**
+ * Translates text typed into the panel.
+ *
+ * Nothing here touches an editor: the text never came from one, so there is no
+ * selection to mark, no marker to swap for an hourglass and no popup to open.
+ */
+async function translateFreeText(text: string): Promise<void> {
+    const cfg = config();
+    const from = cfg.get<string>('sourceLanguage', 'auto')!;
+    const to = cfg.get<string>('targetLanguage', 'vi')!;
+    const apiKey = await getApiKey();
+
+    armed = text;
+    panel?.expect(text);
+    try {
+        const result = await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Window, title: 'Translating…' },
+            () => translate({ text, from, to, apiKey, host: cfg.get<string>('proxy') || undefined })
+        );
+        lastResult = { source: text, translated: result.text, from: result.detectedSource, to };
+        panel?.record(lastResult);
+    } catch (err) {
+        panel?.fail(err instanceof Error ? err.message : String(err));
+    }
 }
 
 /* ------------------------------------------------------------ decoration */
@@ -245,7 +313,9 @@ function onSelectionChange(e: vscode.TextEditorSelectionChangeEvent): void {
         // The selection is still growing under the pointer. A marker drawn now
         // would sit inside the range and jump on the next frame, so the drag
         // runs with nothing on screen and the marker lands once, at the end.
-        e.textEditor.setDecorations(iconDecoration, []);
+        for (const side of SIDES) {
+            e.textEditor.setDecorations(icons[side], []);
+        }
     }
     scheduleDecoration(e.textEditor, dragging);
 }
@@ -305,17 +375,14 @@ function keyOf(range: vscode.Range): string {
  * widget — so a click on it has to be recognised from the selection it leaves
  * behind, and that comparison needs the range it was last drawn for.
  */
-let marker: { uri: string; selection: vscode.Selection } | undefined;
+let marker: { uri: string; selection: vscode.Selection; side: Side } | undefined;
 
 /**
  * Turns a click on the marker into the popup, and reports whether it did.
  *
  * The click itself never arrives: decorations take no input, so what shows up
- * is only its side effect — the pointer landed past the last selected
- * character, which drops the selection onto the position the marker occupies.
- * The glyph is painted between two characters rather than at one, so a click on
- * it can round to either side of the gap; both are accepted, and both are the
- * same gesture to the eye.
+ * is only its side effect — the pointer landed in the gap beside the selection,
+ * which drops the selection onto the position the marker occupies.
  */
 function openedByClick(e: vscode.TextEditorSelectionChangeEvent): boolean {
     const at = marker;
@@ -323,18 +390,15 @@ function openedByClick(e: vscode.TextEditorSelectionChangeEvent): boolean {
         return false;
     }
     const editor = e.textEditor;
-    const cursor = editor.selection.active;
     const on =
         at.uri === editor.document.uri.toString() &&
         editor.selection.isEmpty &&
-        cursor.line === at.selection.end.line &&
-        cursor.character >= at.selection.end.character &&
-        cursor.character <= at.selection.end.character + 1;
+        inMarkerGap(at.selection, at.side, editor.selection.active);
     if (!on) {
         return false;
     }
 
-    // The click landed past the last selected character, so it took the
+    // The click landed in the gap beside the selection, so it took the
     // selection with it. Putting it back is what the rest of the flow reads,
     // and what madeByHand has to answer for, or the marker is taken down the
     // moment the popup goes up.
@@ -427,7 +491,9 @@ function renderDecoration(editor: vscode.TextEditor): void {
 
     if (!cfg.get<boolean>('showIconOnSelect', true) || !text) {
         marker = undefined;
-        editor.setDecorations(iconDecoration, []);
+        for (const side of SIDES) {
+            editor.setDecorations(icons[side], []);
+        }
         return;
     }
 
@@ -444,29 +510,162 @@ function renderDecoration(editor: vscode.TextEditor): void {
         armed = text;
     }
 
-    // The icon is injected after the last selected character. Its own hover is
-    // the gate, so it is only attached while the text still needs approving,
-    // and in click mode only for the one pass that answers a click on it.
+    // The icon is injected beside the selection. Its own hover is the gate, so
+    // it is only attached while the text still needs approving, and in click
+    // mode only for the one pass that answers a click on it.
     const asked = gateOpen;
     gateOpen = false;
 
-    const range = new vscode.Range(selection.end, selection.end);
-    marker = { uri: editor.document.uri.toString(), selection };
-    editor.setDecorations(iconDecoration, [
+    const side = markerSide(editor, selection, cfg);
+    const range = markerRange(side, selection);
+    marker = { uri: editor.document.uri.toString(), selection, side };
+    editor.setDecorations(icons[side], [
         (byPointer(cfg) || asked) && needsApproval(text, cfg)
             ? { range, hoverMessage: gate(text, editor) }
             : { range }
     ]);
+    // The selection before this one may have put the glyph on the other side.
+    editor.setDecorations(icons[side === 'before' ? 'after' : 'before'], []);
 
     if (auto) {
+        // The caret is wherever the gesture left it, which for a left-to-right
+        // drag is the end the popup may have been moved away from.
+        const settled = caretOn(popupSide(editor, selection, cfg), selection);
+        if (!editor.selection.active.isEqual(settled.active)) {
+            editor.selection = settled;
+        }
+        promoteHover();
         void vscode.commands.executeCommand('editor.action.showHover');
     }
 }
 
 function clearMarkers(editor: vscode.TextEditor): void {
     marker = undefined;
-    editor.setDecorations(iconDecoration, []);
-    editor.setDecorations(loadingDecoration, []);
+    for (const side of SIDES) {
+        editor.setDecorations(icons[side], []);
+        editor.setDecorations(loaders[side], []);
+    }
+}
+
+/**
+ * The marker's paint, one decoration type per side.
+ *
+ * The two are the same glyph with its padding mirrored, so it keeps its
+ * distance from the text whichever end of the selection it ends up on.
+ */
+function paint(glyph: string, clickable = false): Record<Side, vscode.TextEditorDecorationType> {
+    const build = (side: Side): vscode.TextEditorDecorationType => {
+        const attachment: vscode.ThemableDecorationAttachmentRenderOptions = {
+            contentText: side === 'before' ? `${glyph} ` : ` ${glyph}`,
+            margin: side === 'before' ? '0 0.25em 0 0' : '0 0 0 0.25em',
+            fontStyle: 'normal',
+            // An attachment has no `cursor` of its own, but textDecoration is
+            // passed through as raw CSS, so the pointer rides along with it.
+            ...(clickable ? { textDecoration: 'none; cursor: pointer' } : {})
+        };
+        const options: vscode.DecorationRenderOptions = {
+            rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+            ...(clickable ? { cursor: 'pointer' } : {})
+        };
+        if (side === 'before') {
+            options.before = attachment;
+        } else {
+            options.after = attachment;
+        }
+        return vscode.window.createTextEditorDecorationType(options);
+    };
+    return { before: build('before'), after: build('after') };
+}
+
+/**
+ * Which end of the selection the marker hangs off.
+ *
+ * An `after` attachment on a selection that ends at end of line is not drawn
+ * among the line's characters: VS Code moves it out into the strip past the
+ * last one, which is the strip GitLens' blame, Error Lens and inline
+ * suggestions write into as well. Nothing orders that strip for us, so the
+ * glyph lands behind whatever else claimed it — pushed far out to the right, or
+ * off screen entirely. Hanging it off the front of the selection instead puts
+ * it back inside the line, where it has the space to itself.
+ */
+function markerSide(
+    editor: vscode.TextEditor,
+    range: vscode.Range,
+    cfg: vscode.WorkspaceConfiguration
+): Side {
+    const configured = cfg.get<string>('iconPosition', 'auto');
+    if (configured === 'before' || configured === 'after') {
+        return configured;
+    }
+    return endsAtEol(editor, range) ? 'before' : 'after';
+}
+
+/** True where a range stops at the last character of its line. */
+function endsAtEol(editor: vscode.TextEditor, range: vscode.Range): boolean {
+    return range.end.character >= editor.document.lineAt(range.end.line).text.length;
+}
+
+/** The empty range a glyph on this side is attached to. */
+function markerRange(side: Side, range: vscode.Range): vscode.Range {
+    return side === 'before'
+        ? new vscode.Range(range.start, range.start)
+        : new vscode.Range(range.end, range.end);
+}
+
+/**
+ * Which end of the selection the popup opens at.
+ *
+ * VS Code opens the hover widget at the leftmost column anything in it claims,
+ * and never to the right of the caret — so this one answer decides both where
+ * the caret is put before `editor.action.showHover` runs and what range
+ * provideHover hands back. The two cannot disagree: a caret at the end with a
+ * range at the start still opens the widget at the start.
+ *
+ * That is also what ties the popup's position to the blame card. The column
+ * past the last character of a line is where GitLens answers a hover with its
+ * commit details (`gitlens.hovers.currentLine.over: "annotation"`), and every
+ * provider answering one position shares the single widget — so a popup asked
+ * for at the end of a selection that runs to end of line opens with GitLens'
+ * card on top of the translation. Under `auto` the popup steps back to the
+ * front of the selection for exactly those selections; `end` keeps it where it
+ * was asked for and takes the card.
+ */
+function popupSide(
+    editor: vscode.TextEditor,
+    range: vscode.Range,
+    cfg: vscode.WorkspaceConfiguration
+): Side {
+    switch (cfg.get<string>('popupPosition', 'auto')) {
+        case 'start':
+            return 'before';
+        case 'end':
+            return 'after';
+        default:
+            return endsAtEol(editor, range) ? 'before' : 'after';
+    }
+}
+
+/** The same selection, re-anchored so the caret rests on the given side. */
+function caretOn(side: Side, selection: vscode.Selection): vscode.Selection {
+    return side === 'before'
+        ? new vscode.Selection(selection.end, selection.start)
+        : new vscode.Selection(selection.start, selection.end);
+}
+
+/**
+ * True where a position falls in the gap the glyph is painted in.
+ *
+ * It sits between two characters rather than on one, so either side of the gap
+ * rounds to it, and a click or a hover on it can arrive as either.
+ */
+function inMarkerGap(range: vscode.Range, side: Side, position: vscode.Position): boolean {
+    const glyph = side === 'before' ? range.start : range.end;
+    const first = side === 'before' ? glyph.character - 1 : glyph.character;
+    return (
+        position.line === glyph.line &&
+        position.character >= first &&
+        position.character <= first + 1
+    );
 }
 
 /** True while translating this text would cost a request the user has not asked for. */
@@ -531,9 +730,43 @@ function buildSpinner(text: string, from: string, to: string): vscode.MarkdownSt
     return md;
 }
 
-/** Collapses a range onto its end, where the 🌐 marker sits. */
-function atMarker(range: vscode.Range): vscode.Range {
-    return new vscode.Range(range.end, range.end);
+/** Collapses a range onto the end the popup opens at. */
+function popupRange(range: vscode.Range, editor: vscode.TextEditor): vscode.Range {
+    return markerRange(popupSide(editor, range, config()), range);
+}
+
+/**
+ * What the hover provider answers for, and how highly it ranks.
+ *
+ * A hover widget is shared. VS Code asks every provider that answers the
+ * position, stacks the replies into the one popup and orders them by how the
+ * providers rank — selector score first, and among equal scores the most
+ * recent registration. GitLens answers the column past the last character of a
+ * line with its commit card, so a translation that ranks below it is stacked
+ * underneath and pushed out of sight.
+ *
+ * The glob is what carries the score: an all-wildcard `{scheme, language}`
+ * filter scores 5, a matching pattern scores 10 — which is what GitLens gets
+ * from registering against the file's own path. It is paired with the wildcard
+ * filter rather than replacing it so that a URI no glob can match still has a
+ * provider, at the lower rank.
+ */
+const HOVER_SELECTOR: vscode.DocumentSelector = [{ scheme: '*', language: '*' }, { pattern: '**/*' }];
+
+let hover: vscode.Disposable | undefined;
+
+/**
+ * Registers the hover provider again, making it the most recent one.
+ *
+ * Score only settles half the order; the rest is registration time, and
+ * GitLens tears its line hover down and puts it back on every line change —
+ * including the selection nudge this extension makes on its way to opening the
+ * popup. Re-registering immediately before the popup is asked for is what
+ * leaves the translation at the top of the widget.
+ */
+function promoteHover(): void {
+    hover?.dispose();
+    hover = vscode.languages.registerHoverProvider(HOVER_SELECTOR, { provideHover });
 }
 
 async function provideHover(
@@ -549,7 +782,11 @@ async function provideHover(
     const cfg = config();
     let range: vscode.Range | undefined;
 
-    const selection = editor.selections.find(s => !s.isEmpty && s.contains(position));
+    const selection = editor.selections.find(
+        s =>
+            !s.isEmpty &&
+            (s.contains(position) || inMarkerGap(s, markerSide(editor, s, cfg), position))
+    );
     if (selection) {
         range = new vscode.Range(selection.start, selection.end);
     } else if (cfg.get<boolean>('hoverOnWord', false)) {
@@ -584,7 +821,7 @@ async function provideHover(
     const to = cfg.get<string>('targetLanguage', 'vi')!;
 
     if (pending === text) {
-        return new vscode.Hover(buildSpinner(text, from, to), atMarker(range));
+        return new vscode.Hover(buildSpinner(text, from, to), popupRange(range, editor));
     }
 
     output.appendLine(`[hover] ${from} -> ${to} :: ${text.slice(0, 60)}`);
@@ -600,16 +837,16 @@ async function provideHover(
         if (token.isCancellationRequested) {
             return undefined;
         }
-        lastResult = { source: text, translated: result.text, from: result.detectedSource, to };
+        file({ source: text, translated: result.text, from: result.detectedSource, to });
         // VS Code places the popup at the start of the hover's range, which for
         // a whole selection means far above the marker the user just clicked.
-        return new vscode.Hover(buildPopup(text, result.text, result.detectedSource, to), atMarker(range));
+        return new vscode.Hover(buildPopup(text, result.text, result.detectedSource, to), popupRange(range, editor));
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         output.appendLine(`[${new Date().toISOString()}] ${message}`);
         const md = new vscode.MarkdownString(`$(error) **Translate failed** — ${escapeMd(message)}`);
         md.supportThemeIcons = true;
-        return new vscode.Hover(md, atMarker(range));
+        return new vscode.Hover(md, popupRange(range, editor));
     }
 }
 
@@ -843,6 +1080,7 @@ async function replaceSelectionCommand(): Promise<void> {
                     host: cfg.get<string>('proxy') || undefined
                 })
         );
+        file({ source: text, translated: result.text, from: result.detectedSource, to: cfg.get<string>('targetLanguage', 'vi')! });
         await editor.edit(builder => builder.replace(selection, result.text));
     } catch (err) {
         vscode.window.showErrorMessage(`Quick Translate: ${err instanceof Error ? err.message : String(err)}`);
@@ -990,12 +1228,26 @@ async function reopenPopup(): Promise<void> {
     // paints the finished translation instead of asking provideHover to wait
     // with the widget already open.
     pending = text || undefined;
+    const where = resultTarget(cfg);
+    if (text) {
+        panel?.expect(text);
+    }
     const fetching = whileLoading(editor, () =>
         vscode.window.withProgress(
             { location: vscode.ProgressLocation.Window, title: 'Translating…' },
             () => prefetch(editor)
         )
     );
+
+    // Nothing to open, so nothing to race: the panel carries its own spinner
+    // and is updated in place, which is the whole dance the popup needs.
+    if (where === 'panel') {
+        file(await fetching);
+        pending = undefined;
+        renderDecoration(editor);
+        await panel?.reveal();
+        return;
+    }
 
     // Two ways to reach the answer without a spinner: it is already held, or it
     // arrives before the spinner would have earned its place. Both open one
@@ -1022,7 +1274,7 @@ async function reopenPopup(): Promise<void> {
         }
     }
 
-    await fetching;
+    file(await fetching);
     pending = undefined;
 
     if (shownAt !== undefined) {
@@ -1033,6 +1285,24 @@ async function reopenPopup(): Promise<void> {
     }
 
     await showPopup(editor);
+    if (where === 'both') {
+        await panel?.reveal();
+    }
+}
+
+/**
+ * Records an answer as the most recent result and files it in the transcript.
+ *
+ * The panel keeps its history whichever surface the user reads the answer on —
+ * only where it is *shown* follows `showResultIn`.
+ */
+function file(answered: Answered | undefined): void {
+    if (!answered) {
+        panel?.expect(undefined);
+        return;
+    }
+    lastResult = answered;
+    panel?.record(answered);
 }
 
 /**
@@ -1047,9 +1317,13 @@ async function showPopup(editor: vscode.TextEditor): Promise<void> {
     await vscode.commands.executeCommand('editor.action.hideHover');
 
     const selection = editor.selection;
-    editor.selection = new vscode.Selection(selection.end, selection.end);
+    const settled = caretOn(popupSide(editor, selection, config()), selection);
+    // Somewhere other than where the caret is about to land, so the refusal
+    // cached for that position is dropped.
+    const off = settled.active.isEqual(selection.end) ? selection.start : selection.end;
+    editor.selection = new vscode.Selection(off, off);
     await delay(0);
-    editor.selection = new vscode.Selection(selection.start, selection.end);
+    editor.selection = settled;
 
     // The nudge queued two more debounced passes; drop them so they cannot
     // re-trigger the hover once it is already up.
@@ -1059,42 +1333,57 @@ async function showPopup(editor: vscode.TextEditor): Promise<void> {
     }
 
     renderDecoration(editor);
+    promoteHover();
     await vscode.commands.executeCommand('editor.action.showHover');
 }
 
 /** Swaps the marker for an hourglass until the work settles. */
 async function whileLoading<T>(editor: vscode.TextEditor, work: () => Thenable<T>): Promise<T> {
-    const range = new vscode.Range(editor.selection.end, editor.selection.end);
-    editor.setDecorations(iconDecoration, []);
-    editor.setDecorations(loadingDecoration, [range]);
+    const selection = editor.selection;
+    const side = markerSide(editor, selection, config());
+    const range = markerRange(side, selection);
+    for (const other of SIDES) {
+        editor.setDecorations(icons[other], []);
+    }
+    editor.setDecorations(loaders[side], [range]);
     try {
         return await work();
     } finally {
         // renderDecoration puts the marker back; this only clears the hourglass,
         // and it has to run even when the request failed.
-        editor.setDecorations(loadingDecoration, []);
+        for (const other of SIDES) {
+            editor.setDecorations(loaders[other], []);
+        }
     }
 }
 
-/** Warms the cache for the current selection and language pair. */
-async function prefetch(editor: vscode.TextEditor): Promise<void> {
+/**
+ * Warms the cache for the current selection and language pair, and hands the
+ * answer back so the caller can file it without asking for it a second time.
+ */
+async function prefetch(editor: vscode.TextEditor): Promise<Answered | undefined> {
     const cfg = config();
     const text = prepare(editor.document.getText(editor.selection), cfg);
     if (!text) {
-        return;
+        return undefined;
     }
     // Switching languages on an open popup is a request for the new pair.
     armed = text;
+    const to = cfg.get<string>('targetLanguage', 'vi')!;
     try {
-        await translate({
+        const result = await translate({
             text,
             from: cfg.get<string>('sourceLanguage', 'auto')!,
-            to: cfg.get<string>('targetLanguage', 'vi')!,
+            to,
             apiKey: await getApiKey(),
             host: cfg.get<string>('proxy') || undefined
         });
-    } catch {
-        // provideHover reports the failure in the popup; nothing to do here.
+        return { source: text, translated: result.text, from: result.detectedSource, to };
+    } catch (err) {
+        // The popup reports the failure through provideHover, which runs the
+        // request again off the same cache; the panel has no second chance.
+        panel?.fail(err instanceof Error ? err.message : String(err));
+        return undefined;
     }
 }
 

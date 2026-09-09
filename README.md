@@ -63,6 +63,54 @@ Each block carries its own small toolbar:
 Line breaks in the source are preserved: each line is translated on its own and
 rendered on its own line, so a multi-line comment keeps its shape.
 
+## The Translations panel
+
+The 🌐 icon in the **Secondary Side Bar** — the right-hand strip Claude Code
+and Copilot Chat live in — opens a transcript of everything translated so far,
+newest at the bottom. Set `panelLocation` to `activitybar` to put it on the
+left instead, or just drag the view across; the workbench remembers where you
+leave it. Every translation is recorded there whichever way it
+was made — marker, keybinding, context menu — so the panel is a scrollback the
+popup cannot be.
+
+At the bottom is a box for text that is not in any editor: paste or type,
+press <kbd>Enter</kbd>, and the answer joins the transcript. <kbd>Shift</kbd>
++<kbd>Enter</kbd> makes a new line instead.
+
+Point at any turn for its tools: copy the translation, hear it, open it on
+translate.google.com, or run it again against the current language pair. The
+header carries the same language pair as the status bar and changes it the same
+way.
+
+`historySize` (`50`) caps the transcript; the oldest turns fall off the top.
+`Translate: Clear Translation History` and the panel's own **Clear** button
+empty it.
+
+### Keeping GitLens out of the translation
+
+A hover popup is not the extension's to own. VS Code hands the one hover widget
+to *every* extension that answers the position it was asked at, stacked in one
+list — and the column past the last character of a line is exactly where
+GitLens answers with its commit card. Select a comment that runs to end of line
+and the popup opens with a commit above the translation.
+
+Three ways out, in increasing order of how much they change:
+
+1. Leave `popupPosition` on `auto`. The popup opens at the *front* of a
+   selection that ends at end of line, which is outside the column GitLens
+   answers at. This is the default and costs nothing.
+2. Set `showResultIn` to `panel`. No popup is opened at all — the answer goes
+   to the Translations panel, which is a webview and therefore the extension's
+   alone. Nothing can draw in it.
+3. Turn GitLens' line hovers off: `gitlens.hovers.currentLine.details` for the
+   commit card, `gitlens.hovers.currentLine.changes` for the diff block, or
+   `gitlens.hovers.currentLine.enabled` for both. The inline blame annotation
+   stays.
+
+Where the popup *is* opened, the translation is now ranked above the commit
+card rather than under it, so option 1 and 3 are about tidiness rather than
+about being able to read the answer at all.
+
 ## Click or hover
 
 `quickTranslate.popupTrigger` decides what opens the popup. It ships as
@@ -145,7 +193,12 @@ Everything lives under `quickTranslate.*`.
 | `sourceLanguage` | `auto` | Language to translate from, or `auto` to detect |
 | `quickLanguages` | `vi, en, ja, zh-CN` | Codes shown as one-click shortcuts in the popup. Set to `[]` to hide the row |
 | `popupTrigger` | `click` | `click` opens the popup only when the 🌐 marker is clicked; `hover` opens it when you point at the marker. See [Click or hover](#click-or-hover) |
-| `showIconOnSelect` | `true` | Show the 🌐 marker after a selection |
+| `showIconOnSelect` | `true` | Show the 🌐 marker next to a selection |
+| `iconPosition` | `auto` | Which side of the selection the 🌐 marker hangs off. `after` puts it past the last selected character — but on a selection that ends at end of line that is the strip GitLens blame, Error Lens and inline suggestions also draw in, and the marker lands behind them. `auto` puts it in front of the selection for those lines, `before` for every selection |
+| `showResultIn` | `popup` | Where an answered request is shown. `popup` is the hover; `panel` opens no hover at all and sends the answer to the Translations panel; `both` does the two. Every translation is recorded in the panel regardless — this only decides what is brought up |
+| `historySize` | `50` | How many turns the Translations panel keeps |
+| `panelLocation` | `secondary` | Which side bar the panel is contributed to — `secondary` for the right-hand bar, `activitybar` for the left. Needs a window reload |
+| `popupPosition` | `auto` | Which end of the selection the popup opens at. Every extension answering one position shares the one popup, and the column past the last character of a line is where GitLens answers with its commit card — so `end` on a selection that runs to end of line opens the popup with that card above the translation. `auto` opens at the front of the selection for exactly those lines, `start` for every selection |
 | `manualSelectionOnly` | `true` | Only mark selections you made by hand, not ones a command produced |
 | `confirmBeforeTranslate` | `true` | Ask before sending a selection, through the marker's own popup. Turn off to translate on the first click (or on hover, in `hover` mode) |
 | `autoShowPopup` | `false` | Open the popup as soon as text is selected, without hovering. Only used when `popupTrigger` is `hover` |
